@@ -1,9 +1,9 @@
-// server.js — live version with persistent game state
-// Endpoints kept: /, /healthz, /api/register, /api/login, /api/me, /api/dashboard
-// New game endpoints (PUBLIC for QR access):
+// server.js — backend with persistent game state and PUBLIC game endpoints
+// Existing endpoints kept: /, /healthz, /api/register, /api/login, /api/me, /api/dashboard
+// New PUBLIC game endpoints (no auth required):
 //   POST /api/games/crack-the-safe/guess   { guess: "123" } -> { result: "higher"|"lower"|"correct" }
 //   POST /api/games/crack-the-safe/reset   (optional admin later)
-//   POST /api/games/whats-in-the-box/open  { boxId: 7 }      -> { result: "win"|"miss" }
+//   POST /api/games/whats-in-the-box/open  { boxId: 1..20 } -> { result: "win"|"miss" }
 //   POST /api/games/whats-in-the-box/reset (optional admin later)
 //
 // ENV on Render:
@@ -55,7 +55,6 @@ async function ensureSchema() {
     );
   `);
 
-  // Single-row config for each game
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games (
       name text PRIMARY KEY,
@@ -65,24 +64,18 @@ async function ensureSchema() {
     );
   `);
 
-  // Seed Crack the Safe (if absent)
-  const safeRow = await pool.query(`SELECT name FROM games WHERE name = 'crack-the-safe'`);
-  if (safeRow.rowCount === 0) {
+  // Seed Crack the Safe
+  const safe = await pool.query(`SELECT 1 FROM games WHERE name='crack-the-safe'`);
+  if (safe.rowCount === 0) {
     const code = Math.floor(100 + Math.random() * 900).toString();
-    await pool.query(
-      `INSERT INTO games(name, safe_code) VALUES ($1, $2)`,
-      ['crack-the-safe', code]
-    );
+    await pool.query(`INSERT INTO games(name, safe_code) VALUES('crack-the-safe', $1)`, [code]);
   }
 
-  // Seed What’s in the Box (if absent)
-  const boxRow = await pool.query(`SELECT name FROM games WHERE name = 'whats-in-the-box'`);
-  if (boxRow.rowCount === 0) {
-    const winning = Math.floor(Math.random() * 20) + 1; // 1..20
-    await pool.query(
-      `INSERT INTO games(name, winning_box) VALUES ($1, $2)`,
-      ['whats-in-the-box', winning]
-    );
+  // Seed What’s in the Box
+  const box = await pool.query(`SELECT 1 FROM games WHERE name='whats-in-the-box'`);
+  if (box.rowCount === 0) {
+    const winning = Math.floor(Math.random() * 20) + 1;
+    await pool.query(`INSERT INTO games(name, winning_box) VALUES('whats-in-the-box', $1)`, [winning]);
   }
 }
 
@@ -209,7 +202,6 @@ app.post('/api/games/crack-the-safe/guess', async (req, res) => {
       return res.json({ result: 'correct' });
     }
 
-    // give a hint without revealing the code
     const hint = Number(guess) > Number(code) ? 'lower' : 'higher';
     return res.json({ result: hint });
   } catch (e) {
@@ -218,7 +210,7 @@ app.post('/api/games/crack-the-safe/guess', async (req, res) => {
   }
 });
 
-// (Optional) reset endpoint — protect later with auth/role
+// Optional reset (lock down later with auth/role)
 app.post('/api/games/crack-the-safe/reset', async (_req, res) => {
   try {
     const newCode = Math.floor(100 + Math.random() * 900).toString();
@@ -246,7 +238,6 @@ app.post('/api/games/whats-in-the-box/open', async (req, res) => {
     const winning = row.rows[0].winning_box;
 
     if (boxId === winning) {
-      // winner -> rotate to a new winning box
       const next = Math.floor(Math.random() * 20) + 1;
       await pool.query(
         `UPDATE games SET winning_box = $1, updated_at = NOW() WHERE name = 'whats-in-the-box'`,
@@ -261,7 +252,7 @@ app.post('/api/games/whats-in-the-box/open', async (req, res) => {
   }
 });
 
-// (Optional) reset endpoint
+// Optional reset (lock down later with auth/role)
 app.post('/api/games/whats-in-the-box/reset', async (_req, res) => {
   try {
     const next = Math.floor(Math.random() * 20) + 1;
@@ -270,7 +261,7 @@ app.post('/api/games/whats-in-the-box/reset', async (_req, res) => {
        ON CONFLICT (name) DO UPDATE SET winning_box = EXCLUDED.winning_box, updated_at = NOW()`,
       [next]
     );
-    res.json({ ok: true });
+  res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
