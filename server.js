@@ -1,3 +1,8 @@
+// server.js — backend with CORS allow-list + auth + dashboard + games
+// ENV on Render:
+//   DATABASE_URL=postgres://...        (from Railway/Render Postgres)
+//   JWT_SECRET=your_long_random_secret
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
@@ -8,28 +13,42 @@ require('dotenv').config();
 
 const app = express();
 
-// ---- CORS ----
-app.use(cors({
-  origin: true, // Allow all origins for testing (replace with your domain later)
-  credentials: false,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-}));
-app.options('*', cors());
+// ---------- CORS (allow your frontend & local dev) ----------
+const ALLOWED_ORIGINS = [
+  'https://pub-game-frontend.onrender.com', // your live frontend
+  'http://localhost:3000',
+];
 
-// ---- JSON Body ----
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow same-origin / curl / mobile apps (no origin header)
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
+    credentials: false, // we use Authorization: Bearer (no cookies)
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+app.options('*', cors()); // preflight
+
+// ---------- Parsers ----------
 app.use(express.json());
 
-// ---- Config ----
+// ---------- Config / DB ----------
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// ---- DB Schema ----
+// ---------- Schema bootstrap (idempotent) ----------
 async function ensureSchema() {
+  // users
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id uuid PRIMARY KEY,
@@ -40,6 +59,7 @@ async function ensureSchema() {
     );
   `);
 
+  // pubs
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pubs (
       id serial PRIMARY KEY,
@@ -53,30 +73,71 @@ async function ensureSchema() {
     );
   `);
 
+  // games (generic, per your existing schema)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games (
       name text PRIMARY KEY,
       updated_at timestamptz DEFAULT now()
     );
   `);
-
   await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS safe_code text`);
   await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS winning_box integer`);
+  // If your games table now has pub_id with a DEFAULT, inserts below will use that default.
+  await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS pub_id integer`);
 
+  // seed Crack the Safe (respects DEFAULT pub_id if present)
   const safe = await pool.query(`SELECT safe_code FROM games WHERE name='crack-the-safe'`);
   if (safe.rowCount === 0) {
     const code = Math.floor(100 + Math.random() * 900).toString();
-    await pool.query(`INSERT INTO games(name, safe_code) VALUES('crack-the-safe', $1)`, [code]);
+    await pool.query(
+      `INSERT INTO games (name, safe_code) VALUES ('crack-the-safe', $1)
+       ON CONFLICT (name) DO NOTHING`,
+      [code]
+    );
   }
 
+  // seed What's in the Box
   const box = await pool.query(`SELECT winning_box FROM games WHERE name='whats-in-the-box'`);
   if (box.rowCount === 0) {
-    const winning = Math.floor(Math.random() * 20) + 1;
-    await pool.query(`INSERT INTO games(name, winning_box) VALUES('whats-in-the-box', $1)`, [winning]);
+    const winning = Math.floor(Math.random() * 20) + 1; // 1..20
+    await pool.query(
+      `INSERT INTO games (name, winning_box) VALUES ('whats-in-the-box', $1)
+       ON CONFLICT (name) DO NOTHING`,
+      [winning]
+    );
   }
 }
 
-// ---- Auth Middleware ----
+// ---------- Root / health / ping ----------
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'pub-game-backend',
+    health: '/healthz',
+    ping: '/api/ping',
+    login: 'POST /api/login',
+    register: 'POST /api/register',
+    me: 'GET /api/me',
+    dashboard: 'GET /api/dashboard (auth)',
+    games: {
+      crack_the_safe_guess: 'POST /api/games/crack-the-safe/guess { guess }',
+      whats_in_the_box_open: 'POST /api/games/whats-in-the-box/open { boxId }',
+    },
+  });
+});
+
+app.get('/api/ping', (_req, res) => res.json({ message: 'pong' }));
+
+app.get('/healthz', async (_req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT NOW() now');
+    res.json({ ok: true, now: rows[0].now });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ---------- Auth helper ----------
 function requireAuth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if (!token) return res.status(401).json({ error: 'Missing or invalid token' });
@@ -88,16 +149,17 @@ function requireAuth(req, res, next) {
   }
 }
 
-// ---- Routes ----
+// ---------- Auth ----------
 app.post('/api/register', async (req, res) => {
   const { email, password, pubName } = req.body || {};
-  if (!email || !password || !pubName) return res.status(400).json({ error: 'Missing fields' });
+  if (!email || !password || !pubName) return res.status(400).json({ error: 'Missing email, password, or pub name' });
+
   try {
-    const hash = await bcrypt.hash(password, 10);
+    const password_hash = await bcrypt.hash(password, 10);
     const id = crypto.randomUUID();
     await pool.query(
       'INSERT INTO users (id, email, password_hash, pub_name) VALUES ($1,$2,$3,$4)',
-      [id, email, hash, pubName]
+      [id, email, password_hash, pubName]
     );
     res.status(201).json({ userId: id });
   } catch (e) {
@@ -108,20 +170,31 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
+
   try {
     const r = await pool.query('SELECT * FROM users WHERE email=$1 LIMIT 1', [email]);
     const user = r.rows[0];
     if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const token = jwt.sign({ userId: user.id, pubName: user.pub_name || null }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { userId: user.id, pubName: user.pub_name || null },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     res.json({ token });
-  } catch {
+  } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({ userId: req.user.userId, pubName: req.user.pubName || null });
+});
+
+// ---------- Dashboard ----------
 app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
     const u = await pool.query('SELECT pub_id FROM users WHERE id=$1 LIMIT 1', [req.user.userId]);
@@ -133,12 +206,16 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
   }
 });
 
+// ---------- Games (public endpoints) ----------
+
+// Crack the Safe: 3-digit code; returns higher/lower/correct; rolls to a new code on win
 app.post('/api/games/crack-the-safe/guess', async (req, res) => {
   try {
     const guess = String(req.body?.guess || '').trim();
     if (!/^\d{3}$/.test(guess)) return res.status(400).json({ error: 'Guess must be 3 digits' });
 
-    const r = await pool.query(`SELECT safe_code FROM games WHERE name='crack-the-safe'`);
+    const r = await pool.query(`SELECT safe_code FROM games WHERE name='crack-the-safe' LIMIT 1`);
+    if (!r.rowCount) return res.status(400).json({ error: 'Game not initialised' });
     const code = r.rows[0].safe_code;
 
     if (guess === code) {
@@ -152,6 +229,7 @@ app.post('/api/games/crack-the-safe/guess', async (req, res) => {
   }
 });
 
+// What's in the Box: 1..20; returns win/miss; rolls to a new winning box on win
 app.post('/api/games/whats-in-the-box/open', async (req, res) => {
   try {
     const boxId = Number(req.body?.boxId);
@@ -159,7 +237,8 @@ app.post('/api/games/whats-in-the-box/open', async (req, res) => {
       return res.status(400).json({ error: 'boxId must be 1..20' });
     }
 
-    const r = await pool.query(`SELECT winning_box FROM games WHERE name='whats-in-the-box'`);
+    const r = await pool.query(`SELECT winning_box FROM games WHERE name='whats-in-the-box' LIMIT 1`);
+    if (!r.rowCount) return res.status(400).json({ error: 'Game not initialised' });
     const winning = r.rows[0].winning_box;
 
     if (boxId === winning) {
@@ -173,13 +252,15 @@ app.post('/api/games/whats-in-the-box/open', async (req, res) => {
   }
 });
 
-// ---- Start ----
+// ---------- 404 JSON ----------
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+// ---------- Start ----------
 app.listen(PORT, async () => {
   try {
     await ensureSchema();
-    console.log(`Server running on ${PORT}`);
   } catch (e) {
-    console.error('Schema error', e);
-    process.exit(1);
+    console.error('Startup schema error (continuing to serve):', e);
   }
+  console.log(`Server running on port ${PORT}`);
 });
