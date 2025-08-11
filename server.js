@@ -29,8 +29,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// --- boot-time schema + seed ---
+// ---------- boot-time schema (adds columns if missing) ----------
 async function ensureSchema() {
+  // Users
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -38,8 +39,10 @@ async function ensureSchema() {
       password_hash text NOT NULL,
       pub_name text,
       pub_id integer
-    )
+    );
   `);
+
+  // Pubs
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pubs (
       id serial PRIMARY KEY,
@@ -50,32 +53,44 @@ async function ensureSchema() {
       created_at timestamptz DEFAULT now(),
       expires_at timestamptz,
       stripe_customer_id text
-    )
+    );
   `);
+
+  // Games base table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games (
       name text PRIMARY KEY,
-      safe_code text,
-      winning_box integer,
       updated_at timestamptz DEFAULT now()
-    )
+    );
   `);
 
-  // seed code/box once
-  const safe = await pool.query(`SELECT 1 FROM games WHERE name='crack-the-safe'`);
+  // Ensure columns exist (idempotent)
+  await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS safe_code text`);
+  await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS winning_box integer`);
+
+  // Seed Crack the Safe if absent
+  const safe = await pool.query(`SELECT safe_code FROM games WHERE name='crack-the-safe'`);
   if (safe.rowCount === 0) {
     const code = Math.floor(100 + Math.random() * 900).toString();
-    await pool.query(`INSERT INTO games(name, safe_code) VALUES('crack-the-safe', $1)`, [code]);
+    await pool.query(
+      `INSERT INTO games(name, safe_code) VALUES('crack-the-safe', $1)`,
+      [code]
+    );
   }
-  const box = await pool.query(`SELECT 1 FROM games WHERE name='whats-in-the-box'`);
+
+  // Seed What’s in the Box if absent
+  const box = await pool.query(`SELECT winning_box FROM games WHERE name='whats-in-the-box'`);
   if (box.rowCount === 0) {
-    const winning = Math.floor(Math.random() * 20) + 1;
-    await pool.query(`INSERT INTO games(name, winning_box) VALUES('whats-in-the-box', $1)`, [winning]);
+    const winning = Math.floor(Math.random() * 20) + 1; // 1..20
+    await pool.query(
+      `INSERT INTO games(name, winning_box) VALUES('whats-in-the-box', $1)`,
+      [winning]
+    );
   }
 }
 
-// --- health & root ---
-app.get('/', (req, res) => {
+// ---------- health & root ----------
+app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'pub-game-backend',
@@ -100,7 +115,7 @@ app.get('/healthz', async (_req, res) => {
   }
 });
 
-// --- helpers ---
+// ---------- helpers ----------
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -113,7 +128,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-// --- auth ---
+// ---------- auth ----------
 app.post('/api/register', async (req, res) => {
   const { email, password, pubName } = req.body || {};
   if (!email || !password || !pubName) return res.status(400).json({ error: 'Missing email, password, or pub name' });
@@ -150,7 +165,7 @@ app.get('/api/me', requireAuth, (req, res) => {
   res.json({ userId: req.user.userId, pubName: req.user.pubName || null });
 });
 
-// --- dashboard ---
+// ---------- dashboard ----------
 app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
     const u = await pool.query('SELECT pub_id FROM users WHERE id=$1 LIMIT 1', [req.user.userId]);
@@ -188,7 +203,7 @@ app.post('/api/games/crack-the-safe/guess', async (req, res) => {
   }
 });
 
-// Optional reset (lock later)
+// Optional reset (lock later with auth/role)
 app.post('/api/games/crack-the-safe/reset', async (_req, res) => {
   try {
     const next = Math.floor(100 + Math.random() * 900).toString();
@@ -227,7 +242,7 @@ app.post('/api/games/whats-in-the-box/open', async (req, res) => {
   }
 });
 
-// Optional reset (lock later)
+// Optional reset (lock later with auth/role)
 app.post('/api/games/whats-in-the-box/reset', async (_req, res) => {
   try {
     const next = Math.floor(Math.random() * 20) + 1;
@@ -242,9 +257,10 @@ app.post('/api/games/whats-in-the-box/reset', async (_req, res) => {
   }
 });
 
-// 404 fallback
+// ---------- 404 fallback ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
+// ---------- start ----------
 app.listen(PORT, async () => {
   await ensureSchema();
   console.log(`Server running on port ${PORT}`);
