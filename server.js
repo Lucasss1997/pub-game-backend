@@ -1,8 +1,12 @@
-// server.js — drop‑in with Admin (products + jackpot) + auth + dashboard
-// ENV needed on Render:
-//   DATABASE_URL=postgres://...
-//   JWT_SECRET=your_long_random_secret
-// Optional:
+// server.js — Pub Game backend (drop‑in)
+// - Health & friendly root
+// - Auth: register/login/me (JWT)
+// - Dashboard: fetch pub for logged-in user
+// - Admin: products (ticket prices/active), jackpot, debug
+//
+// ENV (Render/Railway):
+//   DATABASE_URL=postgres://...           (required)
+//   JWT_SECRET=your_long_random_secret    (required)
 //   PORT=10000 (Render sets this automatically)
 
 const express = require('express');
@@ -14,68 +18,16 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// --- DB ---
+// --- DB (Render/Railway compatible) ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
-// Create tables if missing (idempotent)
-async function ensureSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      pub_name TEXT,
-      pub_id INTEGER,               -- optional link to pubs
-      created_at timestamptz DEFAULT now()
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS pubs (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      city TEXT,
-      address TEXT,
-      active BOOLEAN DEFAULT true,
-      expires_at timestamptz,
-      stripe_customer_id TEXT,
-      created_at timestamptz DEFAULT now()
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS pub_game_products (
-      id SERIAL PRIMARY KEY,
-      pub_id INTEGER NOT NULL,
-      game_key TEXT NOT NULL,
-      name TEXT NOT NULL,
-      price_cents INTEGER NOT NULL DEFAULT 0,
-      active BOOLEAN NOT NULL DEFAULT true,
-      sort_order INTEGER DEFAULT 0,
-      created_at timestamptz DEFAULT now(),
-      UNIQUE (pub_id, game_key)
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS jackpots (
-      pub_id INTEGER PRIMARY KEY,
-      jackpot_cents INTEGER NOT NULL DEFAULT 0,
-      updated_at timestamptz DEFAULT now()
-    );
-  `);
-}
-ensureSchema().catch((e) => {
-  console.error('Schema init error:', e);
-  process.exit(1);
-});
-
-// Parse JSON AFTER any raw-body webhooks (we have none here)
-app.use(express.json());
 
 // --- Health & Root ---
 app.get('/', (req, res) => {
@@ -89,9 +41,9 @@ app.get('/', (req, res) => {
     dashboard: 'GET /api/dashboard (auth)',
     admin: {
       products_get: 'GET /api/admin/products (auth)',
-      products_post: 'POST /api/admin/products (auth)',
+      products_put: 'PUT /api/admin/products (auth)',
       jackpot_get: 'GET /api/admin/jackpot (auth)',
-      jackpot_post: 'POST /api/admin/jackpot (auth)',
+      jackpot_put: 'PUT /api/admin/jackpot (auth)',
       debug: 'GET /api/admin/debug (auth)',
     },
   });
@@ -118,6 +70,11 @@ function requireAuth(req, res, next) {
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
+}
+
+async function getUserPubId(userId) {
+  const { rows } = await pool.query('SELECT pub_id FROM users WHERE id = $1 LIMIT 1', [userId]);
+  return rows[0]?.pub_id || null;
 }
 
 // --- Auth ---
@@ -186,159 +143,189 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
   }
 });
 
-// ----------------------- ADMIN ROUTES -----------------------
+// =====================================================================
+// ADMIN ROUTES — Products (ticket pricing) & Jackpot
+// Tables expected:
+//   pubs(id, name, ..., jackpot_cents int NULL)
+//   users(id, email, password_hash, pub_id uuid/int, ...)
+//   pub_game_products(id serial, pub_id, game_key text, name text,
+//                     price_cents int, active bool, sort_order int,
+//                     UNIQUE(pub_id, game_key))
+// =====================================================================
 
-// Utils
-function poundsToCents(x) {
-  const n = Number(x);
-  if (!isFinite(n)) return 0;
-  return Math.round(n * 100);
-}
-function centsToPounds(c) {
-  const n = Number(c || 0);
-  return Number((n / 100).toFixed(2));
+// Ensure jackpot column exists (idempotent)
+async function ensureJackpotColumn() {
+  await pool.query('ALTER TABLE pubs ADD COLUMN IF NOT EXISTS jackpot_cents integer');
 }
 
-// GET products for this pub
+// GET /api/admin/debug — small snapshot for diagnostics
+app.get('/api/admin/debug', requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { rows: u } = await pool.query('SELECT id, email, pub_id FROM users WHERE id = $1', [uid]);
+    const pubId = u[0]?.pub_id || null;
+    let productsCount = 0;
+    let jackpot = null;
+
+    if (pubId) {
+      const { rows: pr } = await pool.query('SELECT COUNT(*)::int AS c FROM pub_game_products WHERE pub_id = $1', [pubId]);
+      productsCount = pr[0]?.c || 0;
+      await ensureJackpotColumn();
+      const { rows: jr } = await pool.query('SELECT jackpot_cents FROM pubs WHERE id = $1', [pubId]);
+      jackpot = jr[0]?.jackpot_cents ?? null;
+    }
+
+    res.json({
+      user: u[0] || null,
+      pubId,
+      products: productsCount,
+      jackpot_cents: jackpot,
+    });
+  } catch (e) {
+    console.error('Admin debug error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET products (robust, never 500 to UI)
 app.get('/api/admin/products', requireAuth, async (req, res) => {
   try {
-    const { rows: ur } = await pool.query('SELECT pub_id FROM users WHERE id = $1 LIMIT 1', [req.user.userId]);
-    const pubId = ur[0]?.pub_id;
+    const pubId = await getUserPubId(req.user.userId);
     if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
 
-    // Ensure defaults exist
-    const defaults = [
-      { game_key: 'crack_safe', name: 'Crack the Safe Ticket', price_cents: 200, active: true, sort_order: 1 },
-      { game_key: 'whats_in_box', name: 'What’s in the Box Ticket', price_cents: 200, active: true, sort_order: 2 },
-    ];
-    for (const d of defaults) {
-      await pool.query(
-        `INSERT INTO pub_game_products (pub_id, game_key, name, price_cents, active, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (pub_id, game_key)
-         DO NOTHING`,
-        [pubId, d.game_key, d.name, d.price_cents, d.active, d.sort_order]
-      );
+    // Seed two defaults, but don't fail if this errors
+    try {
+      const defaults = [
+        { game_key: 'crack_safe',   name: 'Crack the Safe Ticket',    price_cents: 200, active: true, sort_order: 1 },
+        { game_key: 'whats_in_box', name: 'What’s in the Box Ticket', price_cents: 200, active: true, sort_order: 2 },
+      ];
+      for (const d of defaults) {
+        await pool.query(
+          `INSERT INTO pub_game_products (pub_id, game_key, name, price_cents, active, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (pub_id, game_key) DO NOTHING`,
+          [pubId, d.game_key, d.name, d.price_cents, d.active, d.sort_order]
+        );
+      }
+    } catch (seedErr) {
+      console.error('Seed defaults error (non-fatal):', seedErr);
     }
 
     const { rows } = await pool.query(
-      `SELECT id, pub_id, game_key, name, price_cents, active, sort_order
+      `SELECT id, pub_id, game_key, name,
+              COALESCE(price_cents, 0) AS price_cents,
+              COALESCE(active, true)   AS active,
+              COALESCE(sort_order, 0)  AS sort_order
          FROM pub_game_products
         WHERE pub_id = $1
         ORDER BY sort_order, id`,
       [pubId]
     );
 
-    res.json({
-      pubId,
-      products: rows.map(r => ({
-        id: r.id,
-        game_key: r.game_key,
-        name: r.name,
-        price: centsToPounds(r.price_cents),
-        active: !!r.active,
-        sort_order: r.sort_order ?? 0,
-      })),
-    });
+    const products = rows.map(r => ({
+      id: r.id,
+      game_key: r.game_key,
+      name: r.name || 'Ticket',
+      price: Number((Number(r.price_cents || 0) / 100).toFixed(2)), // cents -> pounds
+      active: !!r.active,
+      sort_order: Number(r.sort_order || 0),
+    }));
+
+    res.json({ pubId, products });
   } catch (e) {
-    console.error('Admin products GET error:', e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Admin products GET hard error:', e);
+    // Do not block UI
+    res.status(200).json({ pubId: null, products: [] });
   }
 });
 
-// POST upsert products
-app.post('/api/admin/products', requireAuth, async (req, res) => {
+// PUT products (create/update one product)
+// Body shape:
+// { game_key: 'crack_safe', name: 'Crack...', price: 2.5, active: true, sort_order: 1 }
+app.put('/api/admin/products', requireAuth, async (req, res) => {
   try {
-    const { rows: ur } = await pool.query('SELECT pub_id FROM users WHERE id = $1 LIMIT 1', [req.user.userId]);
-    const pubId = ur[0]?.pub_id;
+    const pubId = await getUserPubId(req.user.userId);
     if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
 
-    const items = Array.isArray(req.body?.products) ? req.body.products : [];
-    if (!items.length) return res.status(400).json({ error: 'No products provided' });
+    const { game_key, name, price, active, sort_order } = req.body || {};
+    if (!game_key) return res.status(400).json({ error: 'Missing game_key' });
 
-    for (const it of items) {
-      const gameKey = String(it.game_key || '').trim();
-      const name = String(it.name || '').trim() || 'Ticket';
-      const priceCents = poundsToCents(it.price);
-      const active = !!it.active;
-      const sortOrder = Number(it.sort_order ?? 0);
+    const price_cents = Math.round(Number(price || 0) * 100);
+    const isActive = active === undefined ? true : !!active;
+    const order = Number.isFinite(Number(sort_order)) ? Number(sort_order) : 0;
+    const productName = name || (game_key === 'crack_safe'
+      ? 'Crack the Safe Ticket'
+      : game_key === 'whats_in_box'
+      ? 'What’s in the Box Ticket'
+      : 'Ticket');
 
-      await pool.query(
-        `INSERT INTO pub_game_products (pub_id, game_key, name, price_cents, active, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (pub_id, game_key)
-         DO UPDATE SET name=excluded.name, price_cents=excluded.price_cents,
-                       active=excluded.active, sort_order=excluded.sort_order`,
-        [pubId, gameKey, name, priceCents, active, sortOrder]
-      );
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Admin products POST error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET jackpot for pub
-app.get('/api/admin/jackpot', requireAuth, async (req, res) => {
-  try {
-    const { rows: ur } = await pool.query('SELECT pub_id FROM users WHERE id = $1 LIMIT 1', [req.user.userId]);
-    const pubId = ur[0]?.pub_id;
-    if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
-
-    const { rows } = await pool.query('SELECT jackpot_cents FROM jackpots WHERE pub_id = $1 LIMIT 1', [pubId]);
-    const cents = rows[0]?.jackpot_cents || 0;
-    res.json({ pubId, jackpot: centsToPounds(cents) });
-  } catch (e) {
-    console.error('Admin jackpot GET error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// POST set jackpot (pounds)
-app.post('/api/admin/jackpot', requireAuth, async (req, res) => {
-  try {
-    const { rows: ur } = await pool.query('SELECT pub_id FROM users WHERE id = $1 LIMIT 1', [req.user.userId]);
-    const pubId = ur[0]?.pub_id;
-    if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
-
-    const cents = poundsToCents(req.body?.jackpot);
+    // Ensure unique by (pub_id, game_key)
     await pool.query(
-      `INSERT INTO jackpots (pub_id, jackpot_cents, updated_at)
-       VALUES ($1,$2, now())
-       ON CONFLICT (pub_id)
-       DO UPDATE SET jackpot_cents = excluded.jackpot_cents, updated_at = now()`,
-      [pubId, cents]
+      `INSERT INTO pub_game_products (pub_id, game_key, name, price_cents, active, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (pub_id, game_key)
+       DO UPDATE SET name = EXCLUDED.name,
+                     price_cents = EXCLUDED.price_cents,
+                     active = EXCLUDED.active,
+                     sort_order = EXCLUDED.sort_order`,
+      [pubId, game_key, productName, price_cents, isActive, order]
     );
 
-    res.json({ ok: true, jackpot: centsToPounds(cents) });
+    // Return the refreshed list
+    const { rows } = await pool.query(
+      `SELECT id, pub_id, game_key, name,
+              COALESCE(price_cents, 0) AS price_cents,
+              COALESCE(active, true)   AS active,
+              COALESCE(sort_order, 0)  AS sort_order
+         FROM pub_game_products
+        WHERE pub_id = $1
+        ORDER BY sort_order, id`,
+      [pubId]
+    );
+
+    const products = rows.map(r => ({
+      id: r.id,
+      game_key: r.game_key,
+      name: r.name || 'Ticket',
+      price: Number((Number(r.price_cents || 0) / 100).toFixed(2)),
+      active: !!r.active,
+      sort_order: Number(r.sort_order || 0),
+    }));
+
+    res.json({ pubId, products });
   } catch (e) {
-    console.error('Admin jackpot POST error:', e);
+    console.error('Admin products PUT error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Debug info to help diagnose from the app
-app.get('/api/admin/debug', requireAuth, async (req, res) => {
+// GET jackpot
+app.get('/api/admin/jackpot', requireAuth, async (req, res) => {
   try {
-    const uid = req.user.userId;
-    const u = await pool.query('SELECT id, email, pub_id FROM users WHERE id = $1', [uid]);
-    const pubId = u.rows[0]?.pub_id || null;
-    const prod = pubId
-      ? await pool.query('SELECT count(*) FROM pub_game_products WHERE pub_id = $1', [pubId])
-      : { rows: [{ count: 0 }] };
-    const jack = pubId
-      ? await pool.query('SELECT jackpot_cents FROM jackpots WHERE pub_id = $1', [pubId])
-      : { rows: [] };
-    res.json({
-      user: u.rows[0] || null,
-      pubId,
-      products: Number(prod.rows[0].count || 0),
-      jackpot_cents: jack.rows[0]?.jackpot_cents ?? null,
-    });
+    const pubId = await getUserPubId(req.user.userId);
+    if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
+    await ensureJackpotColumn();
+    const { rows } = await pool.query('SELECT jackpot_cents FROM pubs WHERE id = $1', [pubId]);
+    const cents = rows[0]?.jackpot_cents ?? 0;
+    res.json({ pubId, jackpot: Number((Number(cents) / 100).toFixed(2)) });
   } catch (e) {
-    console.error('Admin debug error:', e);
+    console.error('Jackpot GET error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT jackpot { jackpot: number in pounds }
+app.put('/api/admin/jackpot', requireAuth, async (req, res) => {
+  try {
+    const pubId = await getUserPubId(req.user.userId);
+    if (!pubId) return res.status(400).json({ error: 'No pub linked to this user' });
+    await ensureJackpotColumn();
+    const pounds = Number(req.body?.jackpot || 0);
+    const cents = Math.max(0, Math.round(pounds * 100));
+    await pool.query('UPDATE pubs SET jackpot_cents = $1 WHERE id = $2', [cents, pubId]);
+    res.json({ ok: true, pubId, jackpot: pounds });
+  } catch (e) {
+    console.error('Jackpot PUT error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
