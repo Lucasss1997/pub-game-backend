@@ -1,240 +1,223 @@
-// server/index.js
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
-const cookieParser = require("cookie-parser");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcrypt");
-const { Pool } = require("pg");
+// server.js — per-game jackpot, public meta endpoints, ticket posting, WS broadcasts
+
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const cookieParser = require('cookie-parser');
+const WebSocket = require('ws');
+require('dotenv').config();
 
 const app = express();
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
-app.use(
-  cors({
-    origin: true,
-    credentials: true,
-  })
-);
 app.use(cookieParser());
 
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
+
+// ---------- DB ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-/* -------------------- helpers -------------------- */
+// ---------- Helpers ----------
 function requireAuth(req, res, next) {
-  const bearer = req.headers.authorization;
-  const cookieTok = req.cookies?.token;
-  const token = bearer?.startsWith("Bearer ") ? bearer.slice(7) : cookieTok;
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-
+  const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // { id, pub_id }
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ error: "Invalid token" });
+    res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-function parsePoundsToCents(v) {
-  if (v === null || v === undefined || v === "") return 0;
-  if (typeof v === "number") return Math.round(v * 100);
-  let s = String(v).trim().replace(/[£,\s]/g, "").replace(/p$/i, "");
-  if (!/^\d+(\.\d{0,2})?$/.test(s)) throw Object.assign(new Error("Invalid money format"), { status: 400 });
+function parsePoundsToCents(input) {
+  if (input === null || input === undefined) return 0;
+  if (typeof input === 'number' && Number.isFinite(input)) return Math.round(input * 100);
+  let s = String(input).trim().replace(/[£\s,]/g, '').replace(/p$/i, '');
+  if (s === '' || s === '.') return 0;
+  if (!/^\d+(\.\d{0,2})?$/.test(s)) {
+    const err = new Error('Invalid money format'); err.status = 400; throw err;
+  }
   return Math.round(parseFloat(s) * 100);
 }
 
-function centsToPounds(cents) {
-  const n = Number(cents || 0);
-  return (n / 100).toFixed(2);
-}
-
-/* -------------------- auth -------------------- */
-// Minimal examples; your schema may already exist.
-app.post("/api/register", async (req, res) => {
+// ---------- Auth ----------
+app.post('/api/register', async (req, res) => {
   const { email, password, pubName } = req.body || {};
-  if (!email || !password || !pubName) return res.status(400).json({ error: "Missing fields" });
-
+  if (!email || !password || !pubName) return res.status(400).json({ error: 'Missing fields' });
   try {
     const hash = await bcrypt.hash(password, 10);
-    const { rows: pubRows } = await pool.query(
-      `INSERT INTO pubs(name) VALUES ($1) RETURNING id`,
-      [pubName]
-    );
-    const pubId = pubRows[0].id;
-
     const { rows } = await pool.query(
-      `INSERT INTO users(email, password_hash, pub_id)
-       VALUES ($1,$2,$3)
-       RETURNING id, email, pub_id`,
-      [email, hash, pubId]
+      `INSERT INTO users(email, password_hash, pub_name)
+       VALUES ($1,$2,$3) RETURNING id, pub_id`,
+      [email, hash, pubName]
     );
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Missing fields" });
-
-  try {
-    const { rows } = await pool.query(`SELECT * FROM users WHERE email=$1`, [email]);
-    if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
     const user = rows[0];
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-
-    const token = jwt.sign({ id: user.id, pub_id: user.pub_id }, JWT_SECRET, { expiresIn: "2d" });
-    res.cookie("token", token, { httpOnly: true, sameSite: "lax", secure: true });
+    const token = jwt.sign({ id: user.id, pub_id: user.pub_id }, JWT_SECRET, { expiresIn: '1d' });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: true });
     res.json({ token });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.post("/api/logout", (req, res) => {
-  res.clearCookie("token");
-  res.json({ ok: true });
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    const u = rows[0];
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: u.id, pub_id: u.pub_id }, JWT_SECRET, { expiresIn: '1d' });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: true });
+    res.json({ token });
+  } catch {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-/* -------------------- dashboard (unchanged) -------------------- */
-app.get("/api/dashboard", requireAuth, async (req, res) => {
+app.post('/api/logout', (req, res) => { res.clearCookie('token'); res.json({ ok: true }); });
+
+// ---------- Admin (existing) ----------
+app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
-    const pubId = req.user.pub_id;
-    const [{ rows: pubRows }, { rows: prodRows }, { rows: jackRows }] = await Promise.all([
-      pool.query(`SELECT name, city, address, expires_on FROM pubs WHERE id=$1`, [pubId]),
-      pool.query(
-        `SELECT game_key, name, price_cents, active
-         FROM pub_game_products
-         WHERE pub_id=$1
-         ORDER BY game_key`,
-        [pubId]
-      ),
-      pool.query(
-        `SELECT game_key, jackpot_cents
-         FROM pub_game_jackpots
-         WHERE pub_id=$1`,
-        [pubId]
-      ),
+    const [pub, products, stats] = await Promise.all([
+      pool.query('SELECT name, city, address, expires_on FROM pubs WHERE id=$1', [req.user.pub_id]),
+      pool.query('SELECT game_key, name, price_cents, active FROM pub_game_products WHERE pub_id=$1 ORDER BY game_key', [req.user.pub_id]),
+      pool.query('SELECT COALESCE(SUM(jackpot_cents),0) as jackpot_cents FROM pub_game_jackpots WHERE pub_id=$1', [req.user.pub_id]),
     ]);
-
-    // attach jackpots to products
-    const jackpotByGame = Object.fromEntries(jackRows.map(r => [r.game_key, r.jackpot_cents]));
-    const products = prodRows.map(p => ({
-      ...p,
-      jackpot_cents: jackpotByGame[p.game_key] || 0,
-    }));
-
     res.json({
-      pub: pubRows[0] || null,
-      products,
-      stats: { players_this_week: 0, prizes_won: 0 }, // fill as needed
+      pub: pub.rows[0] || null,
+      products: products.rows || [],
+      stats: { jackpot_cents: stats.rows[0]?.jackpot_cents || 0 }
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+  } catch {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-/* -------------------- ADMIN: products & per-game jackpots -------------------- */
-
-// Get all products for this pub + jackpots
-app.get("/api/admin/products", requireAuth, async (req, res) => {
+app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
-    const pubId = req.user.pub_id;
-    const { rows: products } = await pool.query(
-      `SELECT game_key, name, price_cents, active
-       FROM pub_game_products
-       WHERE pub_id=$1
-       ORDER BY game_key`,
-      [pubId]
-    );
-    const { rows: jackpots } = await pool.query(
-      `SELECT game_key, jackpot_cents
-       FROM pub_game_jackpots
-       WHERE pub_id=$1`,
-      [pubId]
-    );
-    res.json({
-      products,
-      jackpots: Object.fromEntries(jackpots.map(j => [j.game_key, j.jackpot_cents])),
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Upsert a single product (name, price, active) for a given game_key
-app.post("/api/admin/product", requireAuth, async (req, res) => {
-  try {
-    const pubId = req.user.pub_id;
-    const { game_key, name, price, active } = req.body || {};
-    if (!game_key) return res.status(400).json({ error: "Missing game_key" });
-
-    const price_cents = parsePoundsToCents(price);
-    await pool.query(
-      `INSERT INTO pub_game_products(pub_id, game_key, name, price_cents, active)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (pub_id, game_key)
-       DO UPDATE SET name=EXCLUDED.name, price_cents=EXCLUDED.price_cents, active=EXCLUDED.active`,
-      [pubId, game_key, name || "", price_cents, !!active]
-    );
+    const rows = Array.isArray(req.body?.products) ? req.body.products : [];
+    for (const p of rows) {
+      const priceCents = parsePoundsToCents(p?.price);
+      await pool.query(
+        `INSERT INTO pub_game_products(pub_id, game_key, name, price_cents, active)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (pub_id, game_key) DO UPDATE
+         SET name=EXCLUDED.name, price_cents=EXCLUDED.price_cents, active=EXCLUDED.active`,
+        [req.user.pub_id, p.game_key, p.name || '', priceCents, !!p.active]
+      );
+      // ensure jackpot row exists for that game
+      await pool.query(
+        `INSERT INTO pub_game_jackpots(pub_id, game_key, jackpot_cents)
+         VALUES ($1,$2, COALESCE((SELECT jackpot_cents FROM pub_game_jackpots WHERE pub_id=$1 AND game_key=$2),0))
+         ON CONFLICT (pub_id, game_key) DO NOTHING`,
+        [req.user.pub_id, p.game_key]
+      );
+    }
     res.json({ ok: true });
   } catch (e) {
-    console.error(e);
-    res.status(e.status || 500).json({ error: e.message || "Server error" });
+    res.status(e.status || 500).json({ error: e.message || 'Server error' });
   }
 });
 
-// Get/set per-game jackpot
-app.get("/api/admin/jackpot", requireAuth, async (req, res) => {
+// ---------- NEW: public game meta & ticket endpoints ----------
+app.get('/api/game/:pubId/:gameKey/meta', async (req, res) => {
+  const pubId = Number(req.params.pubId);
+  const gameKey = String(req.params.gameKey);
+  if (!pubId || !gameKey) return res.status(400).json({ error: 'Bad request' });
+
   try {
-    const pubId = req.user.pub_id;
-    const game_key = req.query.game_key;
-    if (!game_key) return res.status(400).json({ error: "Missing game_key" });
     const { rows } = await pool.query(
-      `SELECT jackpot_cents FROM pub_game_jackpots WHERE pub_id=$1 AND game_key=$2`,
-      [pubId, game_key]
+      `SELECT p.game_key, p.name, p.price_cents, p.active,
+              COALESCE(j.jackpot_cents,0) AS jackpot_cents
+         FROM pub_game_products p
+    LEFT JOIN pub_game_jackpots j
+           ON j.pub_id = p.pub_id AND j.game_key = p.game_key
+        WHERE p.pub_id=$1 AND p.game_key=$2`,
+      [pubId, gameKey]
     );
-    res.json({ game_key, jackpot_cents: rows[0]?.jackpot_cents || 0 });
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.post("/api/admin/jackpot", requireAuth, async (req, res) => {
+app.post('/api/game/:pubId/:gameKey/ticket', async (req, res) => {
+  const pubId = Number(req.params.pubId);
+  const gameKey = String(req.params.gameKey);
+  let amount = Number(req.body?.amount || 0); // in cents
+  if (!pubId || !gameKey || !Number.isFinite(amount) || amount < 0) {
+    return res.status(400).json({ error: 'Bad request' });
+  }
+
   try {
-    const pubId = req.user.pub_id;
-    const { game_key, jackpot } = req.body || {};
-    if (!game_key) return res.status(400).json({ error: "Missing game_key" });
-    const cents = parsePoundsToCents(jackpot);
+    // Optional: record sale
     await pool.query(
+      `INSERT INTO game_sales(pub_id, game_key, amount_cents)
+       VALUES ($1,$2,$3)`,
+      [pubId, gameKey, amount]
+    );
+
+    // Update jackpot (here: add full ticket price; change logic if needed)
+    const { rows } = await pool.query(
       `INSERT INTO pub_game_jackpots(pub_id, game_key, jackpot_cents)
        VALUES ($1,$2,$3)
        ON CONFLICT (pub_id, game_key)
-       DO UPDATE SET jackpot_cents=EXCLUDED.jackpot_cents`,
-      [pubId, game_key, cents]
+       DO UPDATE SET jackpot_cents = pub_game_jackpots.jackpot_cents + EXCLUDED.jackpot_cents
+       RETURNING jackpot_cents`,
+      [pubId, gameKey, amount]
     );
-    res.json({ ok: true, game_key, jackpot_cents: cents });
+
+    const jackpot_cents = rows[0].jackpot_cents;
+    broadcast(`jackpot:${pubId}:${gameKey}`, {
+      type: 'jackpot',
+      pubId, gameKey, jackpot_cents
+    });
+
+    res.json({ ok: true, jackpot_cents });
   } catch (e) {
-    console.error(e);
-    res.status(e.status || 500).json({ error: e.message || "Server error" });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-/* -------------------- start -------------------- */
-app.get("/", (_req, res) => res.json({ ok: true, service: "pub-game-backend" }));
+// ---------- Server & WS ----------
+const server = app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
 
-app.listen(PORT, () => {
-  console.log(`Backend running on :${PORT}`);
+const wss = new WebSocket.Server({ server });
+
+/** simple topic pub/sub registry */
+const clients = new Map(); // ws -> Set(topics)
+
+function broadcast(topic, payload) {
+  const str = JSON.stringify(payload);
+  for (const [ws, topics] of clients.entries()) {
+    if (topics.has(topic)) {
+      try { ws.send(str); } catch {}
+    }
+  }
+}
+
+wss.on('connection', (ws) => {
+  clients.set(ws, new Set());
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'subscribe' && typeof msg.topic === 'string') {
+        clients.get(ws).add(msg.topic);
+      }
+    } catch {}
+  });
+  ws.on('close', () => { clients.delete(ws); });
 });
