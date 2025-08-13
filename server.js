@@ -1,4 +1,6 @@
 // server.js
+// Complete backend for Pub Game
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
@@ -10,60 +12,38 @@ require('dotenv').config();
 
 const app = express();
 
-// ---- CONFIG ----
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'PLEASE_SET_JWT_SECRET';
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://pub-game-frontend.onrender.com';
-
-// If behind a proxy (Render), this helps secure cookies work reliably
-app.set('trust proxy', 1);
-
-// CORS must explicitly allow your frontend and send credentials
-app.use(cors({
-  origin: FRONTEND_ORIGIN,
-  credentials: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
-}));
-
+// CORS: allow your frontend origin; credentials for cookie token
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
+app.use(cors({ origin: ALLOW_ORIGIN === '*' ? true : ALLOW_ORIGIN, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
+
+// --- Postgres pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false },
 });
 
 // ---------- Helpers ----------
-function setAuthCookie(res, token) {
-  res.cookie('token', token, {
-    httpOnly: true,
-    secure: true,         // required with SameSite=None
-    sameSite: 'none',     // allow cross-site (frontend <> backend)
-    path: '/',
-    maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
-  });
-}
-
-function clearAuthCookie(res) {
-  res.clearCookie('token', {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    path: '/'
-  });
+function signToken(claims) {
+  return jwt.sign(claims, JWT_SECRET, { expiresIn: '1d' });
 }
 
 function requireAuth(req, res, next) {
-  const bearer = req.headers.authorization || '';
-  const token = req.cookies.token || bearer.replace(/^Bearer\s+/,'');
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const bearer = req.headers.authorization;
+  const headerToken = bearer && bearer.startsWith('Bearer ') ? bearer.slice(7) : null;
+  const cookieToken = req.cookies?.token;
+  const token = headerToken || cookieToken;
+  if (!token) return res.status(401).json({ ok: false, error: 'Unauthorized' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: 'Invalid token' });
   }
 }
 
@@ -83,116 +63,132 @@ function parsePoundsToCents(input) {
   return Math.round(parseFloat(s) * 100);
 }
 
-// ---------- Health & Info ----------
-app.get('/healthz', (req, res) => res.json({ ok: true }));
-app.get('/', (req, res) => res.json({
-  ok: true,
-  service: 'pub-game-backend',
-  health: '/healthz',
-  login: 'POST /api/login',
-  register: 'POST /api/register',
-  me: 'GET /api/me (auth)',
-  dashboard: 'GET /api/dashboard (auth)',
-  admin: {
-    products_get: 'GET /api/admin/products (auth)',
-    products_post: 'POST /api/admin/products (auth)',
-    jackpot_get: 'GET /api/admin/jackpot (auth)',
-    jackpot_post: 'POST /api/admin/jackpot (auth)'
-  }
-}));
+// ---------- Health / Index ----------
+app.get('/healthz', (req, res) => res.json({ ok: true, service: 'pub-game-backend' }));
+app.get('/', (req, res) => {
+  res.type('application/json').send(JSON.stringify({
+    ok: true,
+    service: 'pub-game-backend',
+    health: '/healthz',
+    login: 'POST /api/login',
+    register: 'POST /api/register',
+    me: 'GET /api/me (auth)',
+    dashboard: 'GET /api/dashboard (auth)',
+    admin: {
+      products_get: 'GET /api/admin/products (auth)',
+      products_post: 'POST /api/admin/products (auth)',
+      jackpot_get: 'GET /api/admin/jackpot (auth)',
+      jackpot_post: 'POST /api/admin/jackpot (auth)',
+      debug: 'GET /api/admin/debug (auth)',
+    },
+  }));
+});
 
 // ---------- Auth ----------
 app.post('/api/register', async (req, res) => {
-  const { email, password, pubName } = req.body || {};
-  if (!email || !password || !pubName) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
+  const { email, password, pubId, pubName } = req.body || {};
+  if (!email || !password) return res.status(400).json({ ok: false, error: 'Missing fields' });
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    // Ensure your users table has pub_id. If not, adjust accordingly.
+    const hash = await bcrypt.hash(password, 10);
+    // Create user; optionally link to pub
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, pub_name) VALUES ($1,$2,$3) RETURNING id, pub_id, pub_name',
-      [email, hashedPassword, pubName]
+      `INSERT INTO users (email, password_hash, pub_id, pub_name)
+       VALUES ($1,$2,$3,$4)
+       RETURNING id, email, pub_id`,
+      [email, hash, pubId || null, pubName || null]
     );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    const user = result.rows[0];
+    const token = signToken({ id: user.id, pub_id: user.pub_id || null, email: user.email });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: true });
+    res.json({ ok: true, token });
+  } catch (e) {
+    console.error('[POST /api/register]', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+  if (!email || !password) return res.status(400).json({ ok: false, error: 'Missing fields' });
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
-    if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const user = result.rows[0];
+    const rs = await pool.query('SELECT id, email, password_hash, pub_id FROM users WHERE email=$1', [email]);
+    if (!rs.rows.length) return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    const user = rs.rows[0];
     const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
-
-    // Ensure pub_id exists for this user; many of your queries depend on it
-    const payload = { id: user.id, pub_id: user.pub_id };
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
-
-    setAuthCookie(res, token);
-    res.json({ ok: true });
+    if (!match) return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    const token = signToken({ id: user.id, pub_id: user.pub_id || null, email: user.email });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: true });
+    res.json({ ok: true, token });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[POST /api/login]', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
 app.post('/api/logout', (req, res) => {
-  clearAuthCookie(res);
+  res.clearCookie('token');
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireAuth, async (req, res) => {
-  res.json({ user: req.user });
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({ ok: true, user: req.user });
 });
 
-// ---------- Dashboard ----------
+// ---------- Dashboard (improved & safe) ----------
 app.get('/api/dashboard', requireAuth, async (req, res) => {
-  try {
-    const pubId = req.user.pub_id;
-    if (!pubId) return res.status(400).json({ error: 'No pub_id on user' });
+  const pubId = req.user?.pub_id;
+  if (!pubId) {
+    return res.status(409).json({
+      ok: false,
+      code: 'NO_PUB_ID',
+      error: 'Account is not linked to a pub. Ask an admin to set pub_id for this user.'
+    });
+  }
 
-    const [{ rows: pubRows }, { rows: prodRows }, { rows: statRows }] =
-      await Promise.all([
-        pool.query('SELECT name, city, address, expires_on FROM pubs WHERE id=$1', [pubId]),
-        pool.query('SELECT game_key, name, price_cents, active FROM pub_game_products WHERE pub_id=$1', [pubId]),
-        pool.query('SELECT COALESCE(jackpot_cents,0) AS jackpot_cents, players_this_week, prizes_won FROM pub_stats WHERE pub_id=$1', [pubId]),
-      ]);
+  try {
+    const [pubRs, prodRs, statRs] = await Promise.all([
+      pool.query('SELECT id, name, city, address, expires_on FROM pubs WHERE id=$1', [pubId]),
+      pool.query('SELECT game_key, name, price_cents, active FROM pub_game_products WHERE pub_id=$1 ORDER BY game_key', [pubId]),
+      pool.query('SELECT COALESCE(jackpot_cents,0) AS jackpot_cents, COALESCE(players_this_week,0) AS players_this_week, COALESCE(prizes_won,0) AS prizes_won FROM pub_stats WHERE pub_id=$1', [pubId]),
+    ]);
+
+    if (!pubRs.rows.length) {
+      return res.status(404).json({ ok: false, code: 'PUB_NOT_FOUND', error: `No pub found with id ${pubId}` });
+    }
 
     res.json({
-      pub: pubRows[0] || null,
-      products: prodRows || [],
-      stats: statRows[0] || { jackpot_cents: 0, players_this_week: 0, prizes_won: 0 },
+      ok: true,
+      pub: pubRs.rows[0],
+      products: prodRs.rows || [],
+      stats: statRs.rows[0] || { jackpot_cents: 0, players_this_week: 0, prizes_won: 0 },
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[GET /api/dashboard] error', e);
+    res.status(500).json({ ok: false, code: 'SERVER_ERROR', error: 'Server error' });
   }
 });
 
-// ---------- Admin: Products ----------
+// ---------- Admin: products ----------
 app.get('/api/admin/products', requireAuth, async (req, res) => {
   try {
+    const pubId = req.user?.pub_id;
+    if (!pubId) return res.status(409).json({ ok: false, error: 'NO_PUB_ID' });
     const { rows } = await pool.query(
-      'SELECT id, game_key, name, price_cents, active FROM pub_game_products WHERE pub_id=$1 ORDER BY game_key',
-      [req.user.pub_id]
+      'SELECT game_key, name, price_cents, active FROM pub_game_products WHERE pub_id=$1 ORDER BY game_key',
+      [pubId]
     );
-    res.json({ products: rows });
+    res.json({ ok: true, products: rows || [] });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[GET /api/admin/products]', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
 app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
+    const pubId = req.user?.pub_id;
+    if (!pubId) return res.status(409).json({ ok: false, error: 'NO_PUB_ID' });
+
     const rows = Array.isArray(req.body?.products) ? req.body.products : [];
     for (const p of rows) {
       const priceCents = parsePoundsToCents(p?.price);
@@ -201,53 +197,91 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
          VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (pub_id, game_key) DO UPDATE
          SET name = EXCLUDED.name, price_cents = EXCLUDED.price_cents, active = EXCLUDED.active`,
-        [req.user.pub_id, p.game_key, p.name || '', priceCents, !!p.active]
+        [pubId, p.game_key, p.name || '', priceCents, !!p.active]
       );
     }
     res.json({ ok: true });
   } catch (e) {
-    console.error(e);
-    res.status(e.status || 500).json({ error: e.message || 'Server error' });
+    console.error('[POST /api/admin/products]', e);
+    res.status(e.status || 500).json({ ok: false, error: e.message || 'Server error' });
   }
 });
 
-// ---------- Admin: Jackpot ----------
+// ---------- Admin: jackpot ----------
 app.get('/api/admin/jackpot', requireAuth, async (req, res) => {
   try {
+    const pubId = req.user?.pub_id;
+    if (!pubId) return res.status(409).json({ ok: false, error: 'NO_PUB_ID' });
+
     const { rows } = await pool.query(
-      'SELECT jackpot_cents FROM pub_settings WHERE pub_id=$1',
-      [req.user.pub_id]
+      'SELECT COALESCE(jackpot_cents,0) AS jackpot_cents FROM pub_settings WHERE pub_id=$1',
+      [pubId]
     );
-    const cents = rows[0]?.jackpot_cents ?? 0;
-    res.json({ jackpot_cents: cents });
+    res.json({ ok: true, jackpot_cents: rows[0]?.jackpot_cents ?? 0 });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[GET /api/admin/jackpot]', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
 app.post('/api/admin/jackpot', requireAuth, async (req, res) => {
   try {
+    const pubId = req.user?.pub_id;
+    if (!pubId) return res.status(409).json({ ok: false, error: 'NO_PUB_ID' });
+
     const cents = parsePoundsToCents(req.body?.jackpot);
     await pool.query(
       `INSERT INTO pub_settings (pub_id, jackpot_cents)
        VALUES ($1, $2)
        ON CONFLICT (pub_id) DO UPDATE SET jackpot_cents = EXCLUDED.jackpot_cents`,
-      [req.user.pub_id, cents]
+      [pubId, cents]
     );
     res.json({ ok: true, jackpot_cents: cents });
   } catch (e) {
-    console.error(e);
-    res.status(e.status || 500).json({ error: e.message || 'Server error' });
+    console.error('[POST /api/admin/jackpot]', e);
+    res.status(e.status || 500).json({ ok: false, error: e.message || 'Server error' });
   }
 });
 
-// ---------- WebSocket ----------
-const server = app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// ---------- Admin: debug ----------
+app.get('/api/admin/debug', requireAuth, async (req, res) => {
+  try {
+    const pubId = req.user?.pub_id;
+    const pub = await pool.query('SELECT id FROM pubs WHERE id=$1', [pubId]);
+    const prods = await pool.query('SELECT COUNT(*)::int AS n FROM pub_game_products WHERE pub_id=$1', [pubId]);
+    const jackpot = await pool.query('SELECT COALESCE(jackpot_cents,0) AS jackpot_cents FROM pub_settings WHERE pub_id=$1', [pubId]);
+    res.json({
+      ok: true,
+      user: req.user,
+      pubExists: !!pub.rows.length,
+      products: prods.rows[0]?.n ?? 0,
+      jackpot_cents: jackpot.rows[0]?.jackpot_cents ?? 0
+    });
+  } catch (e) {
+    console.error('[GET /api/admin/debug]', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------- (Optional) Game endpoints (stubs OK) ----------
+app.post('/api/games/crack_the_safe', async (req, res) => {
+  // Expect { guess: "123" } and respond with result
+  const { guess } = req.body || {};
+  if (!/^\d{3}$/.test(String(guess || ''))) {
+    return res.status(400).json({ ok: false, error: 'Guess must be three digits' });
+  }
+  // Demo logic: pretend correct is 459 (replace with your real store)
+  const correct = process.env.SAFE_CODE || '459';
+  const result = guess === correct ? 'correct' : 'incorrect';
+  return res.json({ ok: true, result });
+});
+
+// ---------- Start HTTP & WebSocket ----------
+const server = app.listen(PORT, () => console.log(`Pub Game backend on :${PORT}`));
 const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
   ws.on('message', (msg) => {
-    console.log(`WS: ${msg}`);
-    ws.send(`Echo: ${msg}`);
+    console.log('WS recv:', String(msg));
+    ws.send(String(msg));
   });
 });
